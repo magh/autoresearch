@@ -5,12 +5,14 @@ Usage: uv run train.py
 """
 
 import os
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 import gc
 import math
+import re
+import subprocess
 import time
+from functools import lru_cache
 from dataclasses import dataclass, asdict
 
 import torch
@@ -19,11 +21,49 @@ import torch.nn.functional as F
 
 # Detect AMD ROCm vs NVIDIA CUDA
 IS_ROCM = hasattr(torch.version, 'hip') and torch.version.hip is not None
+if not IS_ROCM and "PYTORCH_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 ATTENTION_BACKEND = os.environ.get("AUTORESEARCH_ATTENTION_BACKEND", "auto").strip().lower()
 MODEL_COMPILE = os.environ.get("AUTORESEARCH_COMPILE", "auto").strip().lower()
 LOGIT_CHUNK_SIZE = int(os.environ.get("AUTORESEARCH_LOGIT_CHUNK_SIZE", "0"))  # 0 = auto
 DEVICE_INDEX = int(os.environ.get("AUTORESEARCH_DEVICE_INDEX", "-1"))  # -1 = auto
+TIME_BUDGET_OVERRIDE = float(os.environ.get("AUTORESEARCH_TIME_BUDGET", "0"))  # 0 = fixed benchmark
+EVAL_BATCH_SIZE = int(os.environ.get("AUTORESEARCH_EVAL_BATCH_SIZE", "0"))  # 0 = auto
+
+
+@lru_cache(maxsize=1)
+def _rocm_product_names():
+    if not IS_ROCM:
+        return {}
+    try:
+        out = subprocess.run(
+            ["rocm-smi", "--showproductname"],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+
+    names = {}
+    pattern = re.compile(r"GPU\[(\d+)\]\s*:\s*Card Series:\s*(.+)")
+    for line in out.stdout.splitlines():
+        match = pattern.search(line)
+        if match:
+            names[int(match.group(1))] = match.group(2).strip()
+    return names
+
+
+def get_device_name(device_index, props=None):
+    if props is None:
+        props = torch.cuda.get_device_properties(device_index)
+    name = props.name
+    if IS_ROCM:
+        rocm_name = _rocm_product_names().get(device_index)
+        if rocm_name:
+            return rocm_name
+    return name
 
 
 def select_device_index():
@@ -37,7 +77,7 @@ def select_device_index():
                 f"AUTORESEARCH_DEVICE_INDEX={DEVICE_INDEX} is out of range for {device_count} visible devices."
             )
         props = torch.cuda.get_device_properties(DEVICE_INDEX)
-        print(f"Using device {DEVICE_INDEX}: {props.name} ({getattr(props, 'gcnArchName', 'unknown')})")
+        print(f"Using device {DEVICE_INDEX}: {get_device_name(DEVICE_INDEX, props)} ({getattr(props, 'gcnArchName', 'unknown')})")
         return DEVICE_INDEX
 
     candidates = []
@@ -51,7 +91,7 @@ def select_device_index():
             -props.total_memory,
             idx,
         )
-        candidates.append((score, idx, props.name, arch))
+        candidates.append((score, idx, get_device_name(idx, props), arch))
 
     _, selected_idx, selected_name, selected_arch = min(candidates)
     print(f"Using device {selected_idx}: {selected_name} ({selected_arch or 'unknown'})")
@@ -60,6 +100,7 @@ def select_device_index():
 
 DEVICE_INDEX = select_device_index()
 torch.cuda.set_device(DEVICE_INDEX)
+GPU_NAME = get_device_name(DEVICE_INDEX)
 
 def _select_attention_backend():
     if ATTENTION_BACKEND not in {"auto", "fa3", "sdpa"}:
@@ -78,7 +119,7 @@ def _select_attention_backend():
         return "sdpa", None
 
     cap = torch.cuda.get_device_capability(DEVICE_INDEX)
-    gpu_name = torch.cuda.get_device_name(DEVICE_INDEX)
+    gpu_name = GPU_NAME
     wants_fa3 = ATTENTION_BACKEND == "fa3" or cap == (9, 0)
     if not wants_fa3:
         print(f"Attention backend: PyTorch SDPA (CUDA fallback for {gpu_name}, capability {cap})")
@@ -628,18 +669,23 @@ _GPU_PEAK_FLOPS = {
     "MI308X": 1307.4e12,
     "MI325X": 1307.4e12,
     "MI250X": 383.0e12,
+    # AMD Radeon AI PRO
+    # Uses AMD's advertised 191 TFLOPS FP16 matrix throughput as a BF16 proxy.
+    "R9700": 191.0e12,
 }
 
 def _detect_peak_flops():
-    gpu_name = torch.cuda.get_device_name(DEVICE_INDEX)
+    gpu_name = GPU_NAME
     for key, flops in _GPU_PEAK_FLOPS.items():
         if key.lower() in gpu_name.lower():
             print(f"Detected GPU: {gpu_name} -> peak BF16 FLOPS: {flops:.1e}")
             return flops
-    print(f"Warning: Unknown GPU '{gpu_name}', defaulting to H100 peak FLOPS for MFU")
-    return 989.5e12
+    print(f"Warning: Unknown GPU '{gpu_name}', MFU reporting disabled")
+    return None
 
 PEAK_BF16_FLOPS = _detect_peak_flops()
+
+TRAINING_TIME_BUDGET = TIME_BUDGET_OVERRIDE if TIME_BUDGET_OVERRIDE > 0 else TIME_BUDGET
 
 
 def _select_device_batch_size():
@@ -647,7 +693,7 @@ def _select_device_batch_size():
         print(f"Device batch size: {DEVICE_BATCH_SIZE} (forced by AUTORESEARCH_DEVICE_BATCH_SIZE)")
         return DEVICE_BATCH_SIZE
 
-    gpu_name = torch.cuda.get_device_name(DEVICE_INDEX).lower()
+    gpu_name = GPU_NAME.lower()
     datacenter_gpus = ("h100", "h200", "a100", "b200", "mi300", "mi308", "mi325", "mi250")
     if any(name in gpu_name for name in datacenter_gpus) and ATTENTION_BACKEND == "fa3":
         batch_size = 128
@@ -657,11 +703,30 @@ def _select_device_batch_size():
         batch_size = 32
     else:
         batch_size = 8
-    print(f"Device batch size: {batch_size} (auto-selected for {torch.cuda.get_device_name(DEVICE_INDEX)})")
+    print(f"Device batch size: {batch_size} (auto-selected for {GPU_NAME})")
     return batch_size
 
 
 DEVICE_BATCH_SIZE = _select_device_batch_size()
+
+
+def _select_eval_batch_size():
+    if EVAL_BATCH_SIZE > 0:
+        print(f"Eval batch size: {EVAL_BATCH_SIZE} (forced by AUTORESEARCH_EVAL_BATCH_SIZE)")
+        return EVAL_BATCH_SIZE
+
+    total_vram_gb = torch.cuda.get_device_properties(DEVICE_INDEX).total_memory / 1024 / 1024 / 1024
+    if total_vram_gb >= 24:
+        batch_size = max(DEVICE_BATCH_SIZE, 32)
+    elif total_vram_gb >= 12:
+        batch_size = max(DEVICE_BATCH_SIZE, 16)
+    else:
+        batch_size = DEVICE_BATCH_SIZE
+    print(f"Eval batch size: {batch_size} (auto-selected for {GPU_NAME})")
+    return batch_size
+
+
+EVAL_BATCH_SIZE = _select_eval_batch_size()
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
@@ -714,10 +779,10 @@ else:
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
 
-print(f"Time budget: {TIME_BUDGET}s")
+print(f"Time budget: {TRAINING_TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
 
-# Schedules (all based on progress = training_time / TIME_BUDGET)
+# Schedules (all based on progress = training_time / TRAINING_TIME_BUDGET)
 
 def get_lr_multiplier(progress):
     if progress < WARMUP_RATIO:
@@ -756,7 +821,7 @@ while True:
         x, y, epoch = next(train_loader)
 
     # Progress and schedules
-    progress = min(total_training_time / TIME_BUDGET, 1.0)
+    progress = min(total_training_time / TRAINING_TIME_BUDGET, 1.0)
     lrm = get_lr_multiplier(progress)
     muon_momentum = get_muon_momentum(step)
     muon_weight_decay = get_weight_decay(progress)
@@ -788,10 +853,11 @@ while True:
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
     pct_done = 100 * progress
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / PEAK_BF16_FLOPS
-    remaining = max(0, TIME_BUDGET - total_training_time)
+    mfu = None if PEAK_BF16_FLOPS is None else 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / PEAK_BF16_FLOPS
+    remaining = max(0, TRAINING_TIME_BUDGET - total_training_time)
+    mfu_text = "n/a" if mfu is None else f"{mfu:.1f}%"
 
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu_text} | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
 
     # GC management (Python's GC causes ~500ms stalls)
     if step == 0:
@@ -804,7 +870,7 @@ while True:
     step += 1
 
     # Time's up — but only stop after warmup steps so we don't count compilation
-    if step > 10 and total_training_time >= TIME_BUDGET:
+    if step > 10 and total_training_time >= TRAINING_TIME_BUDGET:
         break
 
 print()  # newline after \r training log
@@ -813,22 +879,29 @@ total_tokens = step * TOTAL_BATCH_SIZE
 
 # Final eval
 model.eval()
+eval_start = time.time()
 with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+    val_bpb = evaluate_bpb(model, tokenizer, EVAL_BATCH_SIZE)
+eval_seconds = time.time() - eval_start
 
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / PEAK_BF16_FLOPS if total_training_time > 0 else 0
+steady_state_mfu = None if PEAK_BF16_FLOPS is None or total_training_time <= 0 else (
+    100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / PEAK_BF16_FLOPS
+)
 peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")
 print(f"training_seconds: {total_training_time:.1f}")
+print(f"startup_seconds:  {startup_time:.1f}")
+print(f"eval_seconds:     {eval_seconds:.1f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
-print(f"mfu_percent:      {steady_state_mfu:.2f}")
+print(f"mfu_percent:      {'n/a' if steady_state_mfu is None else f'{steady_state_mfu:.2f}'}")
 print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+print(f"eval_batch_size:  {EVAL_BATCH_SIZE}")
