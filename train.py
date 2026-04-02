@@ -702,7 +702,7 @@ def _select_device_batch_size():
     elif ATTENTION_BACKEND == "fa3":
         batch_size = 32
     else:
-        batch_size = 8
+        batch_size = 32
     print(f"Device batch size: {batch_size} (auto-selected for {GPU_NAME})")
     return batch_size
 
