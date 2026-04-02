@@ -17,11 +17,122 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+# Detect AMD ROCm vs NVIDIA CUDA
+IS_ROCM = hasattr(torch.version, 'hip') and torch.version.hip is not None
+
+ATTENTION_BACKEND = os.environ.get("AUTORESEARCH_ATTENTION_BACKEND", "auto").strip().lower()
+MODEL_COMPILE = os.environ.get("AUTORESEARCH_COMPILE", "auto").strip().lower()
+LOGIT_CHUNK_SIZE = int(os.environ.get("AUTORESEARCH_LOGIT_CHUNK_SIZE", "0"))  # 0 = auto
+DEVICE_INDEX = int(os.environ.get("AUTORESEARCH_DEVICE_INDEX", "-1"))  # -1 = auto
+
+
+def select_device_index():
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA/ROCm device not available.")
+
+    device_count = torch.cuda.device_count()
+    if DEVICE_INDEX >= 0:
+        if DEVICE_INDEX >= device_count:
+            raise ValueError(
+                f"AUTORESEARCH_DEVICE_INDEX={DEVICE_INDEX} is out of range for {device_count} visible devices."
+            )
+        props = torch.cuda.get_device_properties(DEVICE_INDEX)
+        print(f"Using device {DEVICE_INDEX}: {props.name} ({getattr(props, 'gcnArchName', 'unknown')})")
+        return DEVICE_INDEX
+
+    candidates = []
+    for idx in range(device_count):
+        props = torch.cuda.get_device_properties(idx)
+        name = props.name.lower()
+        arch = getattr(props, "gcnArchName", "") or ""
+        score = (
+            "780m" in name or "graphics" in name,
+            -getattr(props, "multi_processor_count", 0),
+            -props.total_memory,
+            idx,
+        )
+        candidates.append((score, idx, props.name, arch))
+
+    _, selected_idx, selected_name, selected_arch = min(candidates)
+    print(f"Using device {selected_idx}: {selected_name} ({selected_arch or 'unknown'})")
+    return selected_idx
+
+
+DEVICE_INDEX = select_device_index()
+torch.cuda.set_device(DEVICE_INDEX)
+
+def _select_attention_backend():
+    if ATTENTION_BACKEND not in {"auto", "fa3", "sdpa"}:
+        raise ValueError(
+            "AUTORESEARCH_ATTENTION_BACKEND must be one of: auto, fa3, sdpa"
+        )
+
+    if ATTENTION_BACKEND == "sdpa":
+        print("Attention backend: PyTorch SDPA (forced by AUTORESEARCH_ATTENTION_BACKEND=sdpa)")
+        return "sdpa", None
+
+    if IS_ROCM:
+        if ATTENTION_BACKEND == "fa3":
+            raise RuntimeError("Flash Attention 3 is not supported on ROCm in this repo; use SDPA instead.")
+        print("Attention backend: PyTorch SDPA (ROCm)")
+        return "sdpa", None
+
+    cap = torch.cuda.get_device_capability(DEVICE_INDEX)
+    gpu_name = torch.cuda.get_device_name(DEVICE_INDEX)
+    wants_fa3 = ATTENTION_BACKEND == "fa3" or cap == (9, 0)
+    if not wants_fa3:
+        print(f"Attention backend: PyTorch SDPA (CUDA fallback for {gpu_name}, capability {cap})")
+        return "sdpa", None
+
+    from kernels import get_kernel
+
+    try:
+        repo = "varunneal/flash-attention-3"
+        fa3 = get_kernel(repo).flash_attn_interface
+        print(f"Attention backend: Flash Attention 3 via {repo} on {gpu_name}")
+        return "fa3", fa3
+    except Exception as exc:
+        if ATTENTION_BACKEND == "fa3":
+            raise RuntimeError(f"Failed to initialize Flash Attention 3: {exc}") from exc
+        print(f"Attention backend: PyTorch SDPA (FA3 unavailable: {exc})")
+        return "sdpa", None
+
+ATTENTION_BACKEND, fa3 = _select_attention_backend()
+
+
+def should_compile_model():
+    if MODEL_COMPILE not in {"auto", "0", "1", "false", "true"}:
+        raise ValueError("AUTORESEARCH_COMPILE must be one of: auto, 0, 1, false, true")
+    if MODEL_COMPILE in {"0", "false"}:
+        print("torch.compile: disabled by AUTORESEARCH_COMPILE")
+        return False
+    if MODEL_COMPILE in {"1", "true"}:
+        print("torch.compile: enabled by AUTORESEARCH_COMPILE")
+        return True
+    enabled = ATTENTION_BACKEND == "fa3" and not IS_ROCM
+    reason = "FA3 fast path" if enabled else "fallback backend"
+    print(f"torch.compile: {'enabled' if enabled else 'disabled'} ({reason})")
+    return enabled
+
+
+USE_MODEL_COMPILE = should_compile_model()
+
+
+def select_logit_chunk_size():
+    if LOGIT_CHUNK_SIZE < 0:
+        raise ValueError("AUTORESEARCH_LOGIT_CHUNK_SIZE must be >= 0")
+    if LOGIT_CHUNK_SIZE > 0:
+        print(f"Logit chunk size: {LOGIT_CHUNK_SIZE} (forced by AUTORESEARCH_LOGIT_CHUNK_SIZE)")
+        return LOGIT_CHUNK_SIZE
+    chunk_size = 0 if ATTENTION_BACKEND == "fa3" else 128
+    if chunk_size > 0:
+        print(f"Logit chunk size: {chunk_size} (auto-selected for fallback backend)")
+    else:
+        print("Logit chunk size: full sequence")
+    return chunk_size
+
+
+LOGIT_CHUNK_SIZE = select_logit_chunk_size()
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -58,6 +169,14 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat([y1, y2], 3)
 
 
+def scaled_dot_product_attention(q, k, v):
+    q = q.transpose(1, 2)  # (B, T, H, D) -> (B, H, T, D)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+    y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    return y.transpose(1, 2).contiguous()
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -90,8 +209,13 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
-        y = y.contiguous().view(B, T, -1)
+        if ATTENTION_BACKEND == "fa3":
+            y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        else:
+            # SDPA doesn't support window_size, so SSSL pattern degrades to full
+            # causal attention on layers using the fallback backend.
+            y = scaled_dot_product_attention(q, k, v)
+        y = y.view(B, T, -1)
         y = self.c_proj(y)
         return y
 
@@ -280,14 +404,44 @@ class GPT(nn.Module):
         x = norm(x)
 
         softcap = 15
-        logits = self.lm_head(x)
-        logits = logits.float()
-        logits = softcap * torch.tanh(logits / softcap)
+        if targets is not None and LOGIT_CHUNK_SIZE > 0:
+            loss_parts = []
+            total_loss = None
+            total_tokens = None
+            for start in range(0, T, LOGIT_CHUNK_SIZE):
+                end = min(start + LOGIT_CHUNK_SIZE, T)
+                logits = self.lm_head(x[:, start:end]).float()
+                logits = softcap * torch.tanh(logits / softcap)
+                chunk_targets = targets[:, start:end].reshape(-1)
+                chunk_logits = logits.reshape(-1, logits.size(-1))
+                if reduction == 'none':
+                    loss_parts.append(F.cross_entropy(
+                        chunk_logits, chunk_targets, ignore_index=-1, reduction='none'
+                    ))
+                else:
+                    chunk_loss = F.cross_entropy(
+                        chunk_logits, chunk_targets, ignore_index=-1, reduction='sum'
+                    )
+                    valid_tokens = (chunk_targets != -1).sum()
+                    total_loss = chunk_loss if total_loss is None else total_loss + chunk_loss
+                    total_tokens = valid_tokens if total_tokens is None else total_tokens + valid_tokens
+            if reduction == 'none':
+                return torch.cat(loss_parts, dim=0)
+            if reduction == 'sum':
+                return total_loss
+            if reduction == 'mean':
+                return total_loss / total_tokens.clamp_min(1)
+            raise ValueError(f"Unsupported reduction: {reduction}")
 
+        logits = self.lm_head(x).float()
+        logits = softcap * torch.tanh(logits / softcap)
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
-                                   ignore_index=-1, reduction=reduction)
-            return loss
+            return F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-1,
+                reduction=reduction,
+            )
         return logits
 
 # ---------------------------------------------------------------------------
@@ -302,18 +456,21 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
-@torch.compile(dynamic=False, fullgraph=True)
+_maybe_compile = torch.compile(dynamic=False, fullgraph=True) if not IS_ROCM else lambda fn: fn
+
+@_maybe_compile
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
     p.mul_(1 - lr_t * wd_t)
-    exp_avg.lerp_(grad, 1 - beta1_t)
-    exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
+    dtype = exp_avg.dtype
+    exp_avg.lerp_(grad, (1 - beta1_t).to(dtype=dtype))
+    exp_avg_sq.lerp_(grad.square(), (1 - beta2_t).to(dtype=dtype))
     bias1 = 1 - beta1_t ** step_t
     bias2 = 1 - beta2_t ** step_t
     denom = (exp_avg_sq / bias2).sqrt() + eps_t
     step_size = lr_t / bias1
     p.add_(exp_avg / denom, alpha=-step_size)
 
-@torch.compile(dynamic=False, fullgraph=True)
+@_maybe_compile
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
                     momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
     # Nesterov momentum
@@ -340,7 +497,7 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     red_dim_size = g.size(red_dim)
     v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
     v_norm = v_norm_sq.sqrt()
-    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
+    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), (1 - beta2).to(dtype=second_momentum_buffer.dtype))
     step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
     scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
     v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
@@ -448,7 +605,7 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
 DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+DEVICE_BATCH_SIZE = int(os.environ.get("AUTORESEARCH_DEVICE_BATCH_SIZE", "0"))  # 0 = auto
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -460,7 +617,51 @@ torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
 device = torch.device("cuda")
 autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-H100_BF16_PEAK_FLOPS = 989.5e12
+# Peak BF16 FLOPS by GPU model (for MFU calculation)
+_GPU_PEAK_FLOPS = {
+    "H100":   989.5e12,
+    "H200":   989.5e12,
+    "A100":   312.0e12,
+    "B200":   2250.0e12,
+    # AMD Instinct
+    "MI300X": 1307.4e12,
+    "MI308X": 1307.4e12,
+    "MI325X": 1307.4e12,
+    "MI250X": 383.0e12,
+}
+
+def _detect_peak_flops():
+    gpu_name = torch.cuda.get_device_name(DEVICE_INDEX)
+    for key, flops in _GPU_PEAK_FLOPS.items():
+        if key.lower() in gpu_name.lower():
+            print(f"Detected GPU: {gpu_name} -> peak BF16 FLOPS: {flops:.1e}")
+            return flops
+    print(f"Warning: Unknown GPU '{gpu_name}', defaulting to H100 peak FLOPS for MFU")
+    return 989.5e12
+
+PEAK_BF16_FLOPS = _detect_peak_flops()
+
+
+def _select_device_batch_size():
+    if DEVICE_BATCH_SIZE > 0:
+        print(f"Device batch size: {DEVICE_BATCH_SIZE} (forced by AUTORESEARCH_DEVICE_BATCH_SIZE)")
+        return DEVICE_BATCH_SIZE
+
+    gpu_name = torch.cuda.get_device_name(DEVICE_INDEX).lower()
+    datacenter_gpus = ("h100", "h200", "a100", "b200", "mi300", "mi308", "mi325", "mi250")
+    if any(name in gpu_name for name in datacenter_gpus) and ATTENTION_BACKEND == "fa3":
+        batch_size = 128
+    elif any(name in gpu_name for name in datacenter_gpus):
+        batch_size = 32
+    elif ATTENTION_BACKEND == "fa3":
+        batch_size = 32
+    else:
+        batch_size = 8
+    print(f"Device batch size: {batch_size} (auto-selected for {torch.cuda.get_device_name(DEVICE_INDEX)})")
+    return batch_size
+
+
+DEVICE_BATCH_SIZE = _select_device_batch_size()
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
@@ -505,7 +706,10 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-model = torch.compile(model, dynamic=False)
+if USE_MODEL_COMPILE:
+    model = torch.compile(model, dynamic=False)
+else:
+    print("Model runs without torch.compile")
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
@@ -584,7 +788,7 @@ while True:
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
     pct_done = 100 * progress
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
+    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / PEAK_BF16_FLOPS
     remaining = max(0, TIME_BUDGET - total_training_time)
 
     print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
@@ -615,7 +819,7 @@ with autocast_ctx:
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
+steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / PEAK_BF16_FLOPS if total_training_time > 0 else 0
 peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
 print("---")
